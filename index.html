@@ -486,7 +486,7 @@ function newGame() {
 // ---------------- model list (models/models.json) + loading ----------------
 // Where the trained networks live in the repository
 const REPO = { owner: "FriendlyFexr", name: "GobbletMastermind", branch: "main", dir: "Bots" };
-const MODELS_DIR = `https://raw.githubusercontent.com/${REPO.owner}/${REPO.name}/${REPO.branch}/${REPO.dir}/`;
+const MODELS_DIR = `https://cdn.jsdelivr.net/gh/${REPO.owner}/${REPO.name}@${REPO.branch}/${REPO.dir}/`;
 const netCache = new Map();
 let manifest = [], loadToken = 0;
 
