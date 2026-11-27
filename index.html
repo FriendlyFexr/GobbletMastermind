@@ -54,4 +54,519 @@
   .slot.empty { opacity: .25; }
   .slot.sel { outline: 3px solid var(--accent); }
   .slot .count { position: absolute; right: 0; bottom: 0; font-size: .72rem; font-weight: 700;
-                 background: var(--panel); border: 1px solid var(--line
+                 background: var(--panel); border: 1px solid var(--line); border-radius: 999px; padding: 0 6px; }
+  .disc { border-radius: 50%; border: 3px solid; }
+  .disc.r { background: var(--red); border-color: var(--red-d); }
+  .disc.b { background: var(--blue); border-color: var(--blue-d); }
+  .disc.s0 { width: 20px; height: 20px; } .disc.s1 { width: 34px; height: 34px; } .disc.s2 { width: 50px; height: 50px; }
+
+  #board { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin: 12px 0; }
+  .cell { position: relative; aspect-ratio: 1; background: var(--cell); border-radius: 14px; cursor: pointer;
+          border: 0; padding: 0; font: inherit; color: inherit; overflow: hidden; }
+  .cell:hover { background: var(--cell-hover); }
+  .cell .coord { position: absolute; left: 7px; top: 4px; font-size: .68rem; color: var(--muted); z-index: 5; pointer-events: none; }
+  .piece { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); border-radius: 50%;
+           border: 4px solid; pointer-events: none; }
+  .piece.s0 { --d: 30%; } .piece.s1 { --d: 60%; } .piece.s2 { --d: 92%; }
+  .piece { width: var(--d); height: var(--d); }
+  .piece.r { border-color: var(--red-d); } .piece.b { border-color: var(--blue-d); }
+  .piece.top.r { background: var(--red); } .piece.top.b { background: var(--blue); }
+  .piece.covered { border-style: dashed; opacity: .85; }
+  .piece.covered.r { background: color-mix(in srgb, var(--red) 55%, transparent); }
+  .piece.covered.b { background: color-mix(in srgb, var(--blue) 55%, transparent); }
+  .cell.sel { outline: 3px solid var(--accent); outline-offset: -3px; }
+  .cell.last { box-shadow: inset 0 0 0 3px color-mix(in srgb, var(--accent) 70%, transparent); }
+  .cell.lastfrom { box-shadow: inset 0 0 0 3px color-mix(in srgb, var(--accent) 35%, transparent); }
+  .cell.target::after { content: ""; position: absolute; inset: 0; border-radius: 14px; z-index: 4;
+          border: 3px solid var(--target); background: color-mix(in srgb, var(--target) 14%, transparent); }
+  .cell.win { animation: pulse 1s ease-in-out infinite alternate; }
+  @keyframes pulse { to { background: color-mix(in srgb, var(--target) 35%, var(--cell)); } }
+
+  #log { margin: 14px 0 0; padding: 10px 12px 10px 30px; background: var(--panel); border: 1px solid var(--line);
+         border-radius: 12px; max-height: 180px; overflow: auto; font-size: .85rem; color: var(--muted); }
+  #log li.me { color: var(--text); }
+  details { margin-top: 14px; font-size: .88rem; color: var(--muted); }
+  details summary { cursor: pointer; color: var(--text); font-weight: 600; }
+  #loader { display: none; margin-bottom: 12px; padding: 10px 12px; border: 1px dashed var(--line); border-radius: 10px;
+            font-size: .88rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Gobblet vs Bot</h1>
+  <p class="sub" id="modelinfo">Loading the list of trained networks…</p>
+
+  <div id="loader"></div>
+
+  <div class="controls">
+    <label>Opponent
+      <select id="model" disabled></select>
+    </label>
+    <label>You play
+      <select id="side"><option value="0">Red (moves first)</option><option value="1">Blue (moves second)</option></select>
+    </label>
+    <label>Bot search
+      <select id="sims">
+        <option value="25">Fast</option><option value="100" selected>Normal</option><option value="400">Strong (slower)</option>
+      </select>
+    </label>
+    <button class="btn primary" id="newgame">New game</button>
+  </div>
+
+  <div id="status">…</div>
+
+  <div class="tray" id="trayTop"></div>
+  <div id="board"></div>
+  <div class="tray" id="trayBottom"></div>
+
+  <ol id="log"></ol>
+
+  <details>
+    <summary>Rules</summary>
+    <p>Red and Blue each have six pieces: two each of sizes 1, 2 and 3. On your turn you either <b>place</b> a piece
+    from your supply, or <b>move</b> one of your pieces that is on top of a stack. A larger piece may cover a strictly
+    smaller one (yours or the opponent's). You can't skip a turn. Get three of your pieces on top in a row to win.</p>
+    <p>If you lift a piece and it uncovers an opponent piece that completes <i>their</i> line, they win (if your move also
+    completes your own line at the same time, they still win). A game is a draw after 60 total moves or if a player has no
+    legal move.</p>
+    <p>How to play: click a piece in your supply (or one of your pieces on the board), then click a highlighted square.
+    Pieces underneath a stack are drawn as dashed circles inside the top piece.</p>
+  </details>
+</main>
+
+<script>
+// ============================ ENGINE (game + network + MCTS) ============================
+const RED = 0, BLUE = 1, MAX_MOVES = 60, N_PLACE = 27, N_ACTIONS = 108;
+const TIE_BREAK = "opponent";
+const LINES = [[0,1,2],[3,4,5],[6,7,8],[0,3,6],[1,4,7],[2,5,8],[0,4,8],[2,4,6]];
+
+class Game {
+  constructor() {
+    this.board = Array.from({ length: 9 }, () => [-1, -1, -1]);   // board[cell][size] = owner or -1
+    this.reserve = [[2, 2, 2], [2, 2, 2]];
+    this.player = RED; this.moves = 0; this.winner = -1; this.done = false; this._legal = null;
+  }
+  clone() {
+    const g = Object.create(Game.prototype);
+    g.board = this.board.map(r => r.slice());
+    g.reserve = this.reserve.map(r => r.slice());
+    g.player = this.player; g.moves = this.moves; g.winner = this.winner; g.done = this.done; g._legal = this._legal;
+    return g;
+  }
+  top(c) { const b = this.board[c]; for (let s = 2; s >= 0; s--) if (b[s] >= 0) return s; return -1; }
+  legalActions() {
+    if (this._legal) return this._legal;
+    const p = this.player, tops = [], acts = [];
+    for (let c = 0; c < 9; c++) tops.push(this.top(c));
+    for (let s = 0; s < 3; s++) {
+      if (this.reserve[p][s] > 0) for (let c = 0; c < 9; c++) if (tops[c] < s) acts.push(s * 9 + c);
+    }
+    for (let f = 0; f < 9; f++) {
+      const s = tops[f];
+      if (s >= 0 && this.board[f][s] === p) {
+        for (let t = 0; t < 9; t++) if (t !== f && tops[t] < s) acts.push(N_PLACE + f * 9 + t);
+      }
+    }
+    this._legal = acts;
+    return acts;
+  }
+  step(a) {
+    const p = this.player;
+    if (a < N_PLACE) {
+      const s = Math.floor(a / 9), c = a % 9;
+      this.board[c][s] = p; this.reserve[p][s]--;
+    } else {
+      const f = Math.floor((a - N_PLACE) / 9), t = (a - N_PLACE) % 9;
+      const s = this.top(f);
+      this.board[f][s] = -1; this.board[t][s] = p;
+    }
+    this.moves++;
+    this._checkWinner(p);
+    this.player = 1 - p;
+    this._legal = null;
+    if (!this.done && (this.moves >= MAX_MOVES || this.legalActions().length === 0)) this.done = true;
+    return this;
+  }
+  owners() {
+    const o = [];
+    for (let c = 0; c < 9; c++) { const s = this.top(c); o.push(s >= 0 ? this.board[c][s] : -1); }
+    return o;
+  }
+  _checkWinner(mover) {
+    const o = this.owners(), won = new Set();
+    for (const [a, b, c] of LINES) if (o[a] !== -1 && o[a] === o[b] && o[b] === o[c]) won.add(o[a]);
+    if (won.size === 0) return;
+    this.winner = won.size === 2 ? (TIE_BREAK === "opponent" ? 1 - mover : mover) : [...won][0];
+    this.done = true;
+  }
+  value() { return this.winner === -1 ? 0 : (this.winner === this.player ? 1 : -1); }  // for player to move
+  encode() {
+    const me = this.player, op = 1 - me, x = new Float32Array(108);
+    for (let c = 0; c < 9; c++) for (let s = 0; s < 3; s++) {
+      const o = this.board[c][s];
+      if (o === me) x[s * 9 + c] = 1; else if (o === op) x[(3 + s) * 9 + c] = 1;
+    }
+    for (let s = 0; s < 3; s++) {
+      x.fill(this.reserve[me][s] / 2, (6 + s) * 9, (7 + s) * 9);
+      x.fill(this.reserve[op][s] / 2, (9 + s) * 9, (10 + s) * 9);
+    }
+    return x;
+  }
+}
+
+// ---- Neural network (BatchNorm already folded into the convs by export_weights.py) ----
+// Activations are kept in a zero-padded 5x5 layout per channel so 3x3 convs need no bounds checks.
+const INT = new Int32Array(9), OFF = new Int32Array(81);
+for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++) {
+  const pos = r * 3 + c; INT[pos] = (r + 1) * 5 + (c + 1);
+  for (let kr = 0; kr < 3; kr++) for (let kc = 0; kc < 3; kc++) OFF[pos * 9 + kr * 3 + kc] = (r + kr) * 5 + (c + kc);
+}
+function decodeB64(s) {
+  const bin = atob(s), u = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+  return new Float32Array(u.buffer);
+}
+function conv3(x, cin, L, relu) {
+  const cout = L.shape[0], w = L.w, b = L.b, out = new Float32Array(cout * 25);
+  for (let co = 0; co < cout; co++) {
+    const ob = co * 25;
+    for (let pos = 0; pos < 9; pos++) {
+      let s = b[co];
+      const po = pos * 9;
+      for (let ci = 0; ci < cin; ci++) {
+        const xb = ci * 25, wi = (co * cin + ci) * 9;
+        for (let t = 0; t < 9; t++) s += w[wi + t] * x[xb + OFF[po + t]];
+      }
+      out[ob + INT[pos]] = relu && s < 0 ? 0 : s;
+    }
+  }
+  return out;
+}
+function conv1(x, cin, L) {                       // 1x1 conv + ReLU, padded in -> flat (cout*9) out
+  const cout = L.shape[0], w = L.w, b = L.b, out = new Float32Array(cout * 9);
+  for (let co = 0; co < cout; co++) for (let pos = 0; pos < 9; pos++) {
+    let s = b[co];
+    for (let ci = 0; ci < cin; ci++) s += w[co * cin + ci] * x[ci * 25 + INT[pos]];
+    out[co * 9 + pos] = s < 0 ? 0 : s;
+  }
+  return out;
+}
+function linear(x, L, relu) {
+  const nout = L.shape[0], nin = L.shape[1], out = new Float32Array(nout);
+  for (let o = 0; o < nout; o++) {
+    let s = L.b[o];
+    for (let i = 0; i < nin; i++) s += L.w[o * nin + i] * x[i];
+    out[o] = relu && s < 0 ? 0 : s;
+  }
+  return out;
+}
+class Net {
+  constructor(j) {
+    const L = o => ({ shape: o.shape, w: decodeB64(o.w), b: decodeB64(o.b) });
+    this.ch = j.channels;
+    this.stem = L(j.stem);
+    this.blocks = j.blocks.map(b => ({ c1: L(b.c1), c2: L(b.c2) }));
+    this.pconv = L(j.pconv); this.pfc = L(j.pfc);
+    this.vconv = L(j.vconv); this.vfc1 = L(j.vfc1); this.vfc2 = L(j.vfc2);
+  }
+  forward(x) {                                    // x: Float32Array(12*9) -> {logits(108), value}
+    const xp = new Float32Array(12 * 25);
+    for (let ch = 0; ch < 12; ch++) for (let pos = 0; pos < 9; pos++) xp[ch * 25 + INT[pos]] = x[ch * 9 + pos];
+    let h = conv3(xp, 12, this.stem, true);
+    for (const b of this.blocks) {
+      let y = conv3(h, this.ch, b.c1, true);
+      y = conv3(y, this.ch, b.c2, false);
+      for (let i = 0; i < h.length; i++) { const v = h[i] + y[i]; h[i] = v > 0 ? v : 0; }
+    }
+    const logits = linear(conv1(h, this.ch, this.pconv), this.pfc, false);
+    const v1 = linear(conv1(h, this.ch, this.vconv), this.vfc1, true);
+    const value = Math.tanh(linear(v1, this.vfc2, false)[0]);
+    return { logits, value };
+  }
+}
+
+// ---- MCTS (PUCT), same algorithm as the training script, without root noise ----
+function evaluate(net, game) {
+  const { logits, value } = net.forward(game.encode());
+  const legal = game.legalActions();
+  let m = -Infinity;
+  for (const a of legal) if (logits[a] > m) m = logits[a];
+  let sum = 0;
+  const ex = legal.map(a => { const e = Math.exp(logits[a] - m); sum += e; return e; });
+  return { children: legal.map((a, i) => ({ a, prior: ex[i] / sum, n: 0, w: 0, children: null })), value };
+}
+function selectChild(node, cPuct) {
+  let best = null, bs = -Infinity;
+  const sq = Math.sqrt(node.n + 1);
+  for (const ch of node.children) {
+    const q = ch.n ? -ch.w / ch.n : 0;
+    const s = q + cPuct * ch.prior * sq / (1 + ch.n);
+    if (s > bs) { bs = s; best = ch; }
+  }
+  return best;
+}
+const tick = () => new Promise(r => setTimeout(r, 0));
+async function mcts(game, net, sims, onProgress, isCancelled, cPuct = 1.5) {
+  const root = { prior: 1, n: 0, w: 0, children: evaluate(net, game).children };
+  for (let i = 0; i < sims; i++) {
+    let node = root, g = game.clone();
+    const path = [root];
+    while (node.children && node.children.length) {
+      node = selectChild(node, cPuct);
+      g.step(node.a);
+      path.push(node);
+    }
+    let v;
+    if (g.done) v = g.value();
+    else { const r = evaluate(net, g); node.children = r.children; v = r.value; }
+    for (let k = path.length - 1; k >= 0; k--) { path[k].n++; path[k].w += v; v = -v; }
+    if (i % 5 === 4) {
+      if (onProgress) onProgress(i + 1, sims);
+      await tick();
+      if (isCancelled && isCancelled()) return null;
+    }
+  }
+  return root;
+}
+function bestAction(root) {
+  let best = null;
+  for (const ch of root.children) if (!best || ch.n > best.n) best = ch;
+  return best.a;
+}
+// ============================ END ENGINE ============================
+
+// ================================== UI ==================================
+const CELL_NAME = c => "ABC"[c % 3] + (Math.floor(c / 3) + 1);
+const SIDE_NAME = ["Red", "Blue"];
+const $ = id => document.getElementById(id);
+
+let net = null, game = null, human = RED, thinking = false, loading = true, gen = 0;
+let sel = null, last = null, log = [];
+
+function describe(a, p) {
+  if (a < N_PLACE) return `${SIDE_NAME[p]} places a size ${Math.floor(a / 9) + 1} piece on ${CELL_NAME(a % 9)}`;
+  const f = Math.floor((a - N_PLACE) / 9), t = (a - N_PLACE) % 9;
+  return `${SIDE_NAME[p]} moves ${CELL_NAME(f)} → ${CELL_NAME(t)}`;
+}
+
+function buildBoard() {
+  const b = $("board"); b.innerHTML = "";
+  for (let c = 0; c < 9; c++) {
+    const d = document.createElement("button");
+    d.className = "cell"; d.dataset.c = c; d.type = "button";
+    d.addEventListener("click", () => onCell(c));
+    b.appendChild(d);
+  }
+}
+
+function winCells() {
+  if (!game.done || game.winner === -1) return new Set();
+  const o = game.owners(), s = new Set();
+  for (const [a, b, c] of LINES) if (o[a] === game.winner && o[b] === game.winner && o[c] === game.winner) [a, b, c].forEach(x => s.add(x));
+  return s;
+}
+
+function targets() {
+  const set = new Set();
+  if (!sel) return set;
+  for (const a of game.legalActions()) {
+    if (sel.type === "place" && a < N_PLACE && Math.floor(a / 9) === sel.size) set.add(a % 9);
+    if (sel.type === "move" && a >= N_PLACE && Math.floor((a - N_PLACE) / 9) === sel.from) set.add((a - N_PLACE) % 9);
+  }
+  return set;
+}
+
+function renderTray(el, p, interactive) {
+  const mine = p === human;
+  el.className = "tray" + (!game.done && game.player === p ? " active" : "");
+  let html = `<div class="who">${SIDE_NAME[p]}${mine ? " (you)" : " (bot)"}</div><div class="pieces">`;
+  for (let s = 0; s < 3; s++) {
+    const n = game.reserve[p][s];
+    const isSel = sel && sel.type === "place" && sel.size === s && mine;
+    const cls = ["slot", interactive && n > 0 ? "clickable" : "", n === 0 ? "empty" : "", isSel ? "sel" : ""].join(" ");
+    html += `<button type="button" class="${cls}" data-size="${s}" ${interactive ? "" : "disabled"}>` +
+            `<span class="disc ${p === RED ? "r" : "b"} s${s}"></span><span class="count">×${n}</span></button>`;
+  }
+  el.innerHTML = html + "</div>";
+  if (interactive) el.querySelectorAll(".slot").forEach(b => b.addEventListener("click", () => onTray(+b.dataset.size)));
+}
+
+function render() {
+  const tg = targets(), wc = winCells();
+  document.querySelectorAll(".cell").forEach(el => {
+    const c = +el.dataset.c, top = game.top(c);
+    let html = `<span class="coord">${CELL_NAME(c)}</span>`;
+    for (let s = 2; s >= 0; s--) {
+      const o = game.board[c][s];
+      if (o >= 0) html += `<div class="piece s${s} ${o === RED ? "r" : "b"} ${s === top ? "top" : "covered"}"></div>`;
+    }
+    el.innerHTML = html;
+    el.className = "cell" +
+      (sel && sel.type === "move" && sel.from === c ? " sel" : "") +
+      (tg.has(c) ? " target" : "") +
+      (last && last.to === c ? " last" : "") +
+      (last && last.from === c ? " lastfrom" : "") +
+      (wc.has(c) ? " win" : "");
+  });
+  const canAct = !game.done && !thinking && !loading && game.player === human;
+  renderTray($("trayTop"), 1 - human, false);
+  renderTray($("trayBottom"), human, canAct);
+
+  const st = $("status"); st.className = "";
+  if (game.done) {
+    if (game.winner === -1) st.textContent = game.moves >= MAX_MOVES ? "Draw — move limit reached." : "Draw — no legal moves.";
+    else {
+      const lastMover = 1 - game.player;
+      const youWon = game.winner === human;
+      st.className = youWon ? "win" : "lose";
+      st.textContent = (youWon ? "You win! 🎉" : "The bot wins.") +
+        (game.winner !== lastMover ? (youWon ? " Your piece was uncovered into a line." : " A piece you moved uncovered its line.") : "");
+    }
+  } else if (loading) st.textContent = "Loading model…";
+  else if (thinking) st.textContent = st.dataset.progress || "Bot is thinking…";
+  else st.textContent = sel ? (sel.type === "place" ? "Choose a square for the piece." : "Choose where to move it.") : "Your turn — pick a piece from your supply or the board.";
+
+  const ol = $("log"); ol.innerHTML = "";
+  log.forEach(e => { const li = document.createElement("li"); li.textContent = e.text; if (e.p === human) li.className = "me"; ol.appendChild(li); });
+  ol.scrollTop = ol.scrollHeight;
+}
+
+function onTray(s) {
+  if (game.done || thinking || loading || game.player !== human || game.reserve[human][s] <= 0) return;
+  sel = sel && sel.type === "place" && sel.size === s ? null : { type: "place", size: s };
+  render();
+}
+function onCell(c) {
+  if (game.done || thinking || loading || game.player !== human) return;
+  const legal = game.legalActions();
+  if (sel) {
+    const a = sel.type === "place" ? sel.size * 9 + c : N_PLACE + sel.from * 9 + c;
+    if (legal.includes(a)) { play(a); return; }
+  }
+  const s = game.top(c);
+  if (s >= 0 && game.board[c][s] === human && !(sel && sel.type === "move" && sel.from === c) &&
+      legal.some(a => a >= N_PLACE && Math.floor((a - N_PLACE) / 9) === c)) sel = { type: "move", from: c };
+  else sel = null;
+  render();
+}
+
+function play(a) {
+  const p = game.player;
+  log.push({ text: `${log.length + 1}. ${describe(a, p)}`, p });
+  last = a < N_PLACE ? { to: a % 9, from: -1 } : { from: Math.floor((a - N_PLACE) / 9), to: (a - N_PLACE) % 9 };
+  sel = null;
+  game.step(a);
+  render();
+  if (!game.done && game.player !== human) botTurn();
+}
+
+async function botTurn() {
+  const myGen = gen, sims = +$("sims").value;
+  thinking = true; render();
+  await tick();
+  const root = await mcts(game, net, sims,
+    (i, n) => { $("status").dataset.progress = `Bot is thinking… ${Math.round(100 * i / n)}%`; $("status").textContent = $("status").dataset.progress; },
+    () => myGen !== gen);
+  if (myGen !== gen || !root) return;
+  thinking = false;
+  $("status").dataset.progress = "";
+  play(bestAction(root));
+}
+
+function newGame() {
+  gen++;                                       // cancels any search in flight
+  thinking = false; sel = null; last = null; log = [];
+  human = +$("side").value;
+  game = new Game();
+  buildBoard();
+  render();
+  if (human !== RED) botTurn();
+}
+
+// ---------------- model list (models/models.json) + loading ----------------
+const MODELS_DIR = "models/";
+const netCache = new Map();
+let manifest = [], loadToken = 0;
+
+function modelLabel(m, latestIter) {
+  if (m.iteration == null) return m.file.replace(/\.json$/i, "");
+  return `${m.iteration} training iterations` + (m.iteration === latestIter ? " (latest)" : "");
+}
+async function getNet(file) {
+  if (netCache.has(file)) return netCache.get(file);
+  const r = await fetch(MODELS_DIR + encodeURIComponent(file));
+  if (!r.ok) throw new Error(`HTTP ${r.status} while loading ${file}`);
+  const json = await r.json();
+  const n = new Net(json);
+  n.iteration = json.iteration;
+  netCache.set(file, n);
+  return n;
+}
+function showError(msg) {
+  const el = $("loader");
+  el.textContent = msg; el.style.display = "block";
+}
+async function selectModel(file) {
+  const tok = ++loadToken;
+  gen++; thinking = false; loading = true; sel = null;     // cancels any bot search in flight
+  $("model").disabled = true;
+  render();
+  try {
+    const n = await getNet(file);
+    if (tok !== loadToken) return;                          // user picked another model meanwhile
+    net = n;
+    const m = manifest.find(x => x.file === file) || {};
+    const it = m.iteration != null ? m.iteration : n.iteration;
+    $("modelinfo").textContent = `Opponent: the network ${it != null ? "after " + it + " training iterations" : "from " + file} ` +
+      `(${net.ch} channels × ${net.blocks.length} residual blocks).`;
+    $("loader").style.display = "none";
+    $("model").value = file;
+    try { history.replaceState(null, "", "?model=" + encodeURIComponent(file)); } catch (e) { /* not essential */ }
+    loading = false;
+    $("model").disabled = false;
+    newGame();
+  } catch (e) {
+    if (tok !== loadToken) return;
+    net = null; loading = false;
+    $("model").disabled = false;
+    showError(`Couldn't load ${file}: ${e.message}`);
+    render();
+  }
+}
+async function init() {
+  try {
+    const r = await fetch(MODELS_DIR + "models.json");
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const j = await r.json();
+    manifest = Array.isArray(j) ? j : j.models;
+    if (!manifest || !manifest.length) throw new Error("the list is empty");
+  } catch (e) {
+    $("modelinfo").textContent = "No models available.";
+    showError(`Couldn't load ${MODELS_DIR}models.json (${e.message}). ` +
+      `This page needs to be served over http(s), e.g. from GitHub Pages, or locally with "python -m http.server". ` +
+      `Opening index.html directly from disk won't work.`);
+    loading = false; render();
+    return;
+  }
+  // newest first
+  manifest.sort((a, b) => (b.iteration ?? -1) - (a.iteration ?? -1) || a.file.localeCompare(b.file));
+  const latestIter = Math.max(...manifest.map(m => m.iteration ?? -1));
+  const select = $("model");
+  select.innerHTML = "";
+  for (const m of manifest) {
+    const o = document.createElement("option");
+    o.value = m.file; o.textContent = modelLabel(m, latestIter);
+    select.appendChild(o);
+  }
+  const wanted = new URLSearchParams(location.search).get("model");
+  await selectModel(manifest.some(m => m.file === wanted) ? wanted : manifest[0].file);
+}
+$("newgame").addEventListener("click", () => { if (net && !loading) newGame(); });
+$("side").addEventListener("change", () => { if (net && !loading) newGame(); });
+$("model").addEventListener("change", e => selectModel(e.target.value));
+
+game = new Game(); buildBoard(); render();
+init();
+</script>
+</body>
+</html>
